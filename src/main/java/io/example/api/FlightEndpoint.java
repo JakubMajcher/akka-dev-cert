@@ -1,10 +1,5 @@
 package io.example.api;
 
-import java.util.Collections;
-
-import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
-
 import akka.http.javadsl.model.HttpResponse;
 import akka.javasdk.annotations.Acl;
 import akka.javasdk.annotations.http.Delete;
@@ -15,9 +10,15 @@ import akka.javasdk.client.ComponentClient;
 import akka.javasdk.http.AbstractHttpEndpoint;
 import akka.javasdk.http.HttpException;
 import akka.javasdk.http.HttpResponses;
+import io.example.application.BookingSlotEntity;
+import io.example.application.FlightConditionsAgent;
+import io.example.application.ParticipantSlotsView;
 import io.example.application.ParticipantSlotsView.SlotList;
+import io.example.domain.Participant;
 import io.example.domain.Participant.ParticipantType;
 import io.example.domain.Timeslot;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 @Acl(allow = @Acl.Matcher(principal = Acl.Principal.INTERNET))
 @HttpEndpoint("/flight")
@@ -37,10 +38,39 @@ public class FlightEndpoint extends AbstractHttpEndpoint {
     public HttpResponse createBooking(String slotId, BookingRequest request) {
         log.info("Creating booking for slot {}: {}", slotId, request);
 
-        // Implementation here
+        if (request == null) throw HttpException.badRequest("request body is required");
+        if (request.bookingId() == null || request.bookingId().trim().isEmpty()) throw HttpException.badRequest("bookingId is required");
+        if (request.studentId() == null || request.studentId().trim().isEmpty()) throw HttpException.badRequest("studentId is required");
+        if (request.aircraftId() == null || request.aircraftId().trim().isEmpty()) throw HttpException.badRequest("aircraftId is required");
+        if (request.instructorId() == null || request.instructorId().trim().isEmpty()) throw HttpException.badRequest("instructorId is required");
 
-        // Make sure to get a flight conditions report from the AI agent and use that
-        // to decide if the booking can be created
+        log.info("Consulting AI Agent for flight conditions in slot {}", slotId);
+
+        String now = java.time.LocalDateTime.now().format(java.time.format.DateTimeFormatter.ofPattern("yyyy-MM-dd-HH"));
+        if (slotId.compareTo(now) <= 0) {
+            throw HttpException.badRequest("Cannot book a slot in the past or present. SlotId must be in the future.");
+        }
+
+        FlightConditionsAgent.ConditionsReport report = componentClient
+                .forAgent()
+                .inSession(slotId)
+                .method(FlightConditionsAgent::query)
+                .invoke(slotId);
+
+        if (report == null || report.meetsRequirements() == null || !report.meetsRequirements()) {
+            log.warn("Booking rejected due to flight conditions in slot {}: {}", slotId, report);
+            throw HttpException.badRequest("Flight conditions do not meet requirements for this timeslot.");
+        }
+
+        log.info("Flight conditions approved for slot {}. Proceeding with booking.", slotId);
+        componentClient
+                .forEventSourcedEntity(slotId)
+                .method(BookingSlotEntity::bookSlot)
+                .invoke(new BookingSlotEntity.Command.BookReservation(
+                        request.studentId(),
+                        request.aircraftId(),
+                        request.instructorId(),
+                        request.bookingId()));
 
         return HttpResponses.created();
     }
@@ -49,9 +79,12 @@ public class FlightEndpoint extends AbstractHttpEndpoint {
     // ID and the booking ID are required.
     @Delete("/bookings/{slotId}/{bookingId}")
     public HttpResponse cancelBooking(String slotId, String bookingId) {
-        log.info("Canceling booking id {}", bookingId);
+        log.info("Canceling bookingId {} by slotId {}", bookingId, slotId);
 
-        // Add booking cancellation code
+        componentClient
+                .forEventSourcedEntity(slotId)
+                .method(BookingSlotEntity::cancelBooking)
+                .invoke(bookingId);
 
         return HttpResponses.ok();
     }
@@ -60,20 +93,23 @@ public class FlightEndpoint extends AbstractHttpEndpoint {
     // Used to retrieve bookings and slots in which the participant is available
     @Get("/slots/{participantId}/{status}")
     public SlotList slotsByStatus(String participantId, String status) {
+        String normalizedStatus = status == null ? "" : status.trim().toLowerCase();
 
-        // Add view query
-
-        return new SlotList(Collections.emptyList());
+        log.info("Getting availability for participantId {} by status {}", participantId, normalizedStatus);
+        return componentClient
+                .forView()
+                .method(ParticipantSlotsView::getSlotsByParticipantAndStatus)
+                .invoke(new ParticipantSlotsView.ParticipantStatusInput(participantId, normalizedStatus));
     }
 
     // Returns the internal availability state for a given slot
     @Get("/availability/{slotId}")
     public Timeslot getSlot(String slotId) {
-
-        // Add entity state request
-
-        return new Timeslot(Collections.emptySet(),
-                Collections.emptySet());
+        log.info("Getting availability for slot {}", slotId);
+        return componentClient
+                .forEventSourcedEntity(slotId)
+                .method(BookingSlotEntity::getSlot)
+                .invoke();
     }
 
     // Indicates that the supplied participant is available for booking
@@ -89,9 +125,12 @@ public class FlightEndpoint extends AbstractHttpEndpoint {
             throw HttpException.badRequest("invalid participant type");
         }
 
-        log.info("Marking timeslot available for entity {}", slotId);
-
-        // Add entity client to mark slot available
+        log.info("Marking timeslot available for entity {}. It's for {} who is {}", slotId, request.participantId(), participantType);
+        componentClient
+                .forEventSourcedEntity(slotId)
+                .method(BookingSlotEntity::markSlotAvailable)
+                .invoke(new BookingSlotEntity.Command.MarkSlotAvailable(
+                        new Participant(request.participantId(), participantType)));
 
         return HttpResponses.ok();
     }
@@ -106,8 +145,11 @@ public class FlightEndpoint extends AbstractHttpEndpoint {
             log.warn("Bad participant type {}", request.participantType());
             throw HttpException.badRequest("invalid participant type");
         }
-
-        // Add codce to unmark slot as available
+        componentClient
+                .forEventSourcedEntity(slotId)
+                .method(BookingSlotEntity::unmarkSlotAvailable)
+                .invoke(new BookingSlotEntity.Command.UnmarkSlotAvailable(
+                        new Participant(request.participantId(), participantType)));
 
         return HttpResponses.ok();
     }
